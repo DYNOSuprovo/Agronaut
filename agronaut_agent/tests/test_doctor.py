@@ -185,3 +185,48 @@ def test_distributions_returns_every_visible_agronaut():
     assert isinstance(found, list)
     for d in found:
         assert (d.metadata.get("Name") or "").lower() == "agronaut"
+
+
+def test_check_provider_fails_with_pip_install_when_backend_library_is_missing(monkeypatch):
+    """Hiding langchain_openai makes doctor FAIL with the exact install command instead of OK."""
+    import sys
+
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compat")
+    monkeypatch.setitem(sys.modules, "langchain_openai", None)
+    checks = D.check_provider()
+    assert checks[0].status == FAIL
+    assert "openai_compat" in checks[0].label
+    assert "pip install langchain-openai" in checks[0].fix
+
+
+def test_check_provider_fails_when_installed_backend_raises_on_import(monkeypatch):
+    """A library that is present on disk but fails to load (e.g. wrong-arch wheel) is a FAIL too."""
+    import importlib
+
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compat")
+
+    def broken_import(name, *args, **kwargs):
+        if name == "langchain_openai":
+            raise OSError("wrong ELF class: ELFCLASS32")
+        return importlib.__import__(name, *args, **kwargs)
+
+    monkeypatch.setattr(importlib, "import_module", broken_import)
+    checks = D.check_provider()
+    assert checks[0].status == FAIL
+    assert "OSError" in checks[0].detail
+    assert "pip install langchain-openai" in checks[0].fix
+
+
+def test_check_provider_passes_when_openai_compat_backend_is_importable(monkeypatch):
+    """When the provider module and class load cleanly, doctor reports OK without hitting network."""
+    import sys
+    import types
+
+    fake_mod = types.ModuleType("langchain_openai")
+    fake_mod.ChatOpenAI = object  # type: ignore[attr-defined]
+    monkeypatch.setenv("LLM_PROVIDER", "openai_compat")
+    monkeypatch.setitem(sys.modules, "langchain_openai", fake_mod)
+    checks = D.check_provider()
+    assert checks[0].status == OK
+    assert "provider openai_compat" in checks[0].label
+
