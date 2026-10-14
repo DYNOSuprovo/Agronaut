@@ -110,11 +110,16 @@ def start_turn() -> bool:
     _trace.set(uuid.uuid4().hex[:12])
     _metrics.set({"llm_calls": 0, "llm_ms": 0, "tokens_in": 0, "tokens_out": 0,
                   "tool_calls": 0, "usage_seen": False})
+    # One parent span per turn when local Phoenix tracing is on; a no-op otherwise.
+    from . import otel_phoenix
+    otel_phoenix.begin_turn(_trace.get())
     return True
 
 
 def end_turn() -> None:
     """Close the traced turn. Only the caller that opened it should call this."""
+    from . import otel_phoenix
+    otel_phoenix.end_turn()
     _trace.set(None)
     _metrics.set(None)
 
@@ -149,6 +154,13 @@ def record_tool_call() -> None:
     m = _metrics.get()
     if m is not None:
         m["tool_calls"] += 1
+
+
+def record_grounding(ungrounded_numbers: int) -> None:
+    """How many figures in the turn's reply no tool or user gave (#180). A count only."""
+    m = _metrics.get()
+    if m is not None:
+        m["ungrounded_numbers"] = int(ungrounded_numbers)
 
 
 def turn_metrics() -> dict:

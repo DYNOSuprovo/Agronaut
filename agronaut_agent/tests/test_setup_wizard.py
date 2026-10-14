@@ -200,7 +200,7 @@ def test_the_terminal_is_the_first_channel_offered(tmp_path, monkeypatch):
     """
     seen: list[list[tuple[str, str]]] = []
 
-    def _spy(prompt, options, default=1):
+    def _spy(prompt, options, default=1, recommend=True):
         seen.append(options)
         return 4 if "model" in prompt else 1
 
@@ -260,6 +260,18 @@ def test_option_three_really_reaches_the_whatsapp_branch(tmp_path, monkeypatch, 
     monkeypatch.setattr(W.getpass, "getpass", lambda *a: "")
     W.run()
     out = capsys.readouterr().out
-    # The tunnel is the part that actually blocks people, so it has to be said out loud.
-    assert "cloudflared" in out and "/webhook" in out
+    # The tunnel is the part that actually blocks people, so it has to be said out loud:
+    # now as the one command that starts it and prints the /webhook address for Meta.
+    assert "cloudflared" in out and "agronaut whatsapp --tunnel" in out
+    assert "Configure" in out and "Webhooks" in out
     assert "developers.facebook.com" in out
+
+
+def test_setup_points_at_the_same_ollama_model_the_agent_defaults_to(monkeypatch):
+    """Setup hard-coded qwen2.5 while agent/llm.py moved on; one source now (#181)."""
+    from agent.llm import DEFAULT_MODELS
+
+    monkeypatch.setattr(W.urllib.request, "urlopen",
+                        lambda *a, **k: (_ for _ in ()).throw(OSError("down")))
+    ok, msg = W.check_ollama()
+    assert not ok and DEFAULT_MODELS["ollama"] in msg

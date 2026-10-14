@@ -10,7 +10,7 @@ def test_default_provider_and_model(monkeypatch):
     monkeypatch.delenv("LLM_MODEL", raising=False)
     provider, model = L.resolve()
     assert provider == "ollama"
-    assert model == "qwen2.5"
+    assert model == "qwen3.5:4b"
 
 
 def test_env_selects_provider_and_model(monkeypatch):
@@ -126,7 +126,7 @@ def test_every_default_model_can_bind_tools_or_is_documented_as_hosted():
     start and the error names the provider rather than the model."""
     from langchain_ollama import ChatOllama
     assert hasattr(ChatOllama, "bind_tools")
-    assert L.DEFAULT_MODELS["ollama"].startswith("qwen2.5"), (
+    assert L.DEFAULT_MODELS["ollama"].startswith("qwen3.5"), (
         "the default Ollama tag must be one that supports tool calling; llama3 does not")
 
 
@@ -135,6 +135,41 @@ def test_the_local_provider_has_a_fallback_too():
     than it does for a provider with a big model behind it."""
     assert "ollama" in L.FALLBACK_MODELS
     assert L.FALLBACK_MODELS["ollama"] != L.DEFAULT_MODELS["ollama"]
+
+
+# --- the Ollama context window (#181) ------------------------------------------------------
+#
+# Left unset, Ollama gives any machine under 24 GiB a 4K window and silently cuts the middle
+# out of a prompt that overflows it. Measured: 2,060 of 11,287 tokens kept. These pin that the
+# window is always requested explicitly. Constructing ChatOllama contacts no server.
+
+def test_ollama_is_always_asked_for_an_explicit_context_window(monkeypatch):
+    monkeypatch.delenv("AGRONAUT_OLLAMA_NUM_CTX", raising=False)
+    model = L.get_chat_model(provider="ollama", model="qwen3.5:4b")
+    assert model.num_ctx == L.DEFAULT_OLLAMA_NUM_CTX == 32768
+
+
+def test_the_context_window_can_be_lowered_for_a_small_machine(monkeypatch):
+    monkeypatch.setenv("AGRONAUT_OLLAMA_NUM_CTX", "16384")
+    assert L.get_chat_model(provider="ollama", model="qwen3.5:4b").num_ctx == 16384
+
+
+@pytest.mark.parametrize("bad", ["32k", "", "  ", "512", "-1"])
+def test_an_unusable_context_setting_falls_back_instead_of_breaking_startup(monkeypatch, bad):
+    monkeypatch.setenv("AGRONAUT_OLLAMA_NUM_CTX", bad)
+    assert L.ollama_num_ctx() == L.DEFAULT_OLLAMA_NUM_CTX
+
+
+def test_thinking_is_off_by_default_and_can_be_turned_on(monkeypatch):
+    """Off is safe on a model that cannot think (llama3 accepts think=false); on is not."""
+    monkeypatch.delenv("AGRONAUT_OLLAMA_THINK", raising=False)
+    assert L.get_chat_model(provider="ollama", model="qwen3.5:4b").reasoning is False
+    monkeypatch.setenv("AGRONAUT_OLLAMA_THINK", "on")
+    assert L.get_chat_model(provider="ollama", model="qwen3.5:4b").reasoning is True
+
+
+def test_the_local_fallback_is_smaller_than_the_default():
+    assert L.FALLBACK_MODELS["ollama"] == "qwen3.5:2b"
 
 
 # --- the Anthropic provider ---------------------------------------------------------------
@@ -215,3 +250,39 @@ def test_the_adapter_survives_bind_tools_and_delegates_everything_else():
     assert isinstance(bound, L._AnthropicSystemAdapter)
     bound.invoke([])
     assert inner.got == []
+
+
+def test_a_string_prompt_reaches_anthropic_as_one_whole_message():
+    """get_llm() passes a plain string. The adapter used to iterate it, so "Shade cloth" went
+    out as eleven one-letter messages, the spaces were lost, and the model wrote back
+    "Shadecloth". Every string-prompt caller on Anthropic was affected: the faithfulness and
+    consult evals, and the live agent's background session summary."""
+    from langchain_core.messages import HumanMessage
+
+    inner = _Echo()
+    L._AnthropicSystemAdapter(inner).invoke("Shade cloth, tarps or plastic lids")
+    assert len(inner.got) == 1
+    assert isinstance(inner.got[0], HumanMessage)
+    assert inner.got[0].content == "Shade cloth, tarps or plastic lids"
+
+
+def test_normalize_returns_only_the_text_of_a_reply_that_thought_first():
+    """A Claude reply that thinks first is a LIST of blocks. normalize() used to return the repr
+    of the whole message, so a parser read the signature and the thinking, and the escaped
+    newlines broke "QUOTE: ...\\nVERDICT: ..." into one unmatchable quote."""
+    from langchain_core.messages import AIMessage
+
+    msg = AIMessage(content=[
+        {"type": "thinking", "thinking": "the context says so", "signature": "abc"},
+        {"type": "text", "text": "QUOTE: shade cloth covers tanks\nVERDICT: SUPPORTED"},
+    ])
+    assert L.normalize(msg) == "QUOTE: shade cloth covers tanks\nVERDICT: SUPPORTED"
+
+
+def test_normalize_drops_non_text_blocks():
+    from langchain_core.messages import AIMessage
+
+    msg = AIMessage(content=[{"type": "text", "text": "Check the pump. "},
+                             {"type": "tool_use", "id": "t1", "name": "x", "input": {}},
+                             "Then the aerator."])
+    assert L.normalize(msg) == "Check the pump. Then the aerator."

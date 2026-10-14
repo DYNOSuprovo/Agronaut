@@ -80,3 +80,26 @@ A fixed set of question/answer probes (`docs/dpg/safety_eval/`) exercises design
 troubleshooting, out-of-scope refusals, and trust-gate behavior. It is scored each release
 as a regression signal on advice quality (a report, not a hard gate), following the
 Gates/GIZ AIEP recommendation to hold LLM advisory tools to a golden-set safety check.
+
+## Generation-quality evaluation
+
+Retrieval being right does not make the answer right, so answers are also scored against the
+passages they were written from (`scripts/faithfulness_eval.py`). Each answer is split into
+claims, and a judge model from a different family rules on each one using the retrieved
+context alone. It must quote the supporting sentence, and code checks the quote is really
+there. Citations are checked by code, with no model.
+
+Measured on 2026-10-06 over 33 fresh golden-set answers (484 claims): **faithfulness 0.79**
+with the default judge (gpt-oss-20b, quote-first prompt); citation accuracy 1.00 with no
+fabricated sources. The 2026-09-30 answers scored 0.84 under the same judge, and 0.88 to 0.90
+under the other judges tried. The two runs differ topic by topic in both directions (up to
+0.25 either way on topics of 10 to 60 claims), which is what a fresh set of 33 answers moves
+by, so read the figure as about 0.8 rather than to two decimals.
+
+How far to trust that number: the judge was checked against one person's labels on 29
+claims. Agreement is fair, not strong (Cohen's kappa 0.24 on the blind labels, 0.39 after the
+person took a second look at the 13 disputed claims and changed 2). Both figures are kept
+because the second look was not blind. One judge we tried, Claude Sonnet 5, agreed with the
+person no better than chance and is not used. More labels, ideally from a second person, are
+needed before the figure can be called validated. It is a report, never a gate, and it never
+runs in CI.

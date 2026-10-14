@@ -1,0 +1,194 @@
+# WhatsApp setup, step by step
+
+**Start with Telegram if you can.** It needs one token and nothing else, works on a laptop
+behind any router, and nothing in it expires. WhatsApp is worth the extra work when the
+people you serve are on WhatsApp, and it runs best on a server that stays on.
+
+This guide follows Meta's developer dashboard as it looked on **2026-09-30**. Meta moves
+these screens around; if a name here no longer matches, the values you need are the same.
+
+## What you will collect
+
+Two different things are called "token". Keep them apart; mixing them up is the most common
+reason setup fails.
+
+| Value | Looks like | Where it comes from | Where it goes |
+|---|---|---|---|
+| **Access token** | very long, starts `EAA…` | Meta, Step 1 > Generate token (short-lived), or a permanent System User token (section below) | your `.env` (`WHATSAPP_TOKEN`) |
+| **Verify token** | short, 22 characters | `agronaut setup` makes it for you | Meta's webhook form, Step 2 |
+| Phone Number ID | long number (not a phone number) | Meta, Step 1 | your `.env` |
+| WhatsApp Business account ID | long number | Meta, Step 1 | your `.env` |
+| App secret | 32 characters | Meta, App settings > Basic | your `.env` |
+| Your own WhatsApp number | e.g. `886912345678` | your phone | your `.env` and Meta's recipient list |
+
+`agronaut setup` asks for each of these in this order and writes the `.env` for you.
+
+## 1. Create the app (once)
+
+1. Go to **developers.facebook.com** > **My Apps** > **Create app**.
+2. Choose the use case **Connect on WhatsApp**, and link or create a business portfolio
+   when asked.
+3. You land on **Use cases > Connect on WhatsApp > Customize**. The left panel shows
+   **Basic setup: Step 1. Try it out, Step 2. Production setup, Step 3. Business
+   verification**. You only need Steps 1 and 2 to talk to the bot yourself.
+
+## 2. Step 1. Try it out: the test number and its values
+
+On **Step 1. Try it out**, under **Claim a WhatsApp test number**:
+
+- **Test number**: this is the bot's number, something like `+1 (555) 198-5979`. You will
+  message it from your own phone.
+- **Phone Number ID** and **WhatsApp Business account ID**: copy both.
+- **Access token > Generate token**: copy the long `EAA…` token. This one is for trying
+  things out and is short-lived: on 2026-09-30 one lasted about an hour. Once the bot
+  answers, replace it with a [permanent token](#a-permanent-token-do-this-once).
+
+Under **Send a message from your test number**, open the **To** (recipient) list and add
+**your own WhatsApp number**, then confirm it with the code Meta sends you. Meta's test
+number only talks to numbers on this list.
+
+> The **Send message** button on this screen sends a template *from* the test number *to*
+> you. It does not test the bot. To test the bot, type a message in the WhatsApp app on your
+> phone.
+
+## 3. App secret
+
+**App settings > Basic > App secret**, click **Show**, copy it. With it, the bot checks
+that every message really came from Meta.
+
+## 4. Run setup on your computer
+
+```bash
+agronaut setup
+```
+
+Choose your model, then **WhatsApp** as the channel, and paste the values from steps 2 and
+3 when asked. Your own number goes in **country code first, digits only, no leading 0**:
+Taiwan `0912 345 678` is `886912345678`, Burkina Faso `70 12 34 56` is `22670123456`.
+
+Setup checks the values with Meta straight away and says what is wrong if anything is.
+It keeps your verify token if you run it again, so Meta's saved copy stays valid.
+
+## 5. Start the bot with a public address
+
+Meta delivers messages by calling your computer over HTTPS. On a laptop, one command starts
+the bot and a tunnel together (it needs `cloudflared`: `brew install cloudflared` on a Mac):
+
+```bash
+agronaut whatsapp --tunnel
+```
+
+It prints a box like this:
+
+```
+  Paste these into Meta, then click 'Verify and save':
+    ... > Step 2. Production setup > Configure Webhooks
+
+    Callback URL   https://some-random-words.trycloudflare.com/webhook
+    Verify token   Xy7kQ2mZpL9vRt3wNa8bCd
+```
+
+**Keep this window open.** Closing it takes the address down.
+
+## 6. Step 2. Production setup > Configure Webhooks
+
+1. Open **Step 2. Production setup** and expand **Configure Webhooks**.
+2. **Callback URL**: select everything in the box (Cmd+A / Ctrl+A) and paste the Callback
+   URL from the box above.
+3. **Verify token**: select everything in the box and paste the verify token from the box
+   above. Not the access token.
+4. Click **Verify and save**. The bot window shows `webhook verification OK`.
+5. Under **Webhook fields**, make sure **messages** shows **Subscribed**.
+
+A yellow note on this screen says unpublished apps only receive test webhooks. On
+2026-09-30 messages from a number on the Step 1 recipient list were delivered to an
+unpublished app all the same; publishing is only needed for other people.
+
+## 7. Message the bot
+
+In the WhatsApp app on your phone, open a chat with the test number and send **hi**.
+The bot window logs the message and the bot replies.
+
+## When it does not answer
+
+Run the check. It tests the token, the account, the webhook and your number, and says
+which one is wrong:
+
+```bash
+agronaut whatsapp --check --url https://some-random-words.trycloudflare.com/webhook
+```
+
+The bot window also says why it ignored something:
+
+| The bot window says | What it means | Fix |
+|---|---|---|
+| `verification REFUSED … Meta sent N characters, .env has 22` | the token in Meta's form is an old one | paste the verify token again (step 6) |
+| `… looks like the WhatsApp ACCESS token` | the access token went in the verify box | paste the short verify token instead |
+| `… Meta sent an empty verify token` | a browser opened the address, or the box was empty | nothing, or fill the box (step 6) |
+| `message from a number ending NN DROPPED` | your number is not in `AGRONAUT_ALLOWED_IDS` | fix it in `.env` (digits only, no leading 0) and restart |
+| `delivery status update(s) … failed (error …)` | a reply could not be delivered | the error code says why; often the recipient list |
+| nothing at all | Meta is calling an old address | paste the current Callback URL again (step 6) |
+| `whatsapp send failed (401) … code 190` | the access token expired, so replies cannot be sent | a [permanent token](#a-permanent-token-do-this-once) |
+| `token rejected by the Graph API` in `--check` | the access token expired or was revoked | a [permanent token](#a-permanent-token-do-this-once) |
+
+## A permanent token (do this once)
+
+The test token from Step 1 is short-lived: on 2026-09-30 one lasted about an hour, and the
+bot silently stopped replying when it died. A System User token does not expire. These are
+the screens as they were walked through on 2026-09-30, in Meta Business Settings
+(business.facebook.com), not the developer dashboard:
+
+1. **Settings > Users > System users > + Add.** Name it (e.g. `agronaut-bot`), role
+   **Admin**, **Create system user**.
+2. **Give it your app.** On that system user, **Assign assets > Apps**, tick your app,
+   switch on **Manage app** under *Full control*, **Assign**. The app then shows under
+   *Assigned assets* with **Full access**.
+3. **Give it your WhatsApp account.** **Settings > Business assets > WhatsApp accounts**,
+   select the account the bot uses (the one whose ID is `WHATSAPP_WABA_ID`, for the test
+   number it is called *Test WhatsApp Business Account*), **Assign people**, pick the
+   system user, **Full control**, **Assign**. Back on the system user it now lists
+   2 business assets.
+4. **Generate token** on the system user: your app, **Token expiration: Never**, and the
+   permissions `whatsapp_business_messaging` and `whatsapp_business_management`
+   (Meta's guide also lists `business_management`; the bot works without it). Copy it now,
+   Meta shows it once.
+5. Save it and restart the bot:
+
+   ```bash
+   agronaut whatsapp --token
+   ```
+
+   Paste it (it stays hidden). It is checked with Meta before it replaces the old one, and
+   `agronaut whatsapp --check` should then pass every line.
+
+Meta's own version of these steps is Step 5 of its
+[Get Started guide](https://developers.facebook.com/documentation/business-messaging/whatsapp/get-started).
+
+## For a bot that stays up
+
+With a permanent token, the one thing left that changes is the tunnel address: a quick
+tunnel gets a new one every time it starts, and you paste it into Meta again. To register
+an address once, give the bot a permanent one. Without a domain of your own, Tailscale
+Funnel does it for free (Funnel is in beta and available on every Tailscale plan, per
+Tailscale's docs as of 2026):
+
+```bash
+brew install tailscale                 # the open-source variant; Funnel needs it on a Mac
+sudo brew services start tailscale     # runs in the background and after every restart
+tailscale up                           # log in; creates the free account the first time
+tailscale funnel --bg 8080             # the first time, approve Funnel at the link it prints
+```
+
+The last command prints an address like `https://your-mac.your-tailnet.ts.net`. It stays
+the same, and `--bg` keeps it serving after a reboot. Then, once:
+
+1. Add it to `.env`: `WHATSAPP_PUBLIC_URL=https://your-mac.your-tailnet.ts.net`
+2. Paste `https://your-mac.your-tailnet.ts.net/webhook` as the Callback URL on Configure
+   Webhooks (section 6), with your verify token, and click Verify and save.
+
+From then on start the bot with plain `agronaut whatsapp` (no `--tunnel`). It checks the
+permanent address answers Meta's handshake and says so in its log; if it does not,
+`tailscale funnel status` should show `http://127.0.0.1:8080`.
+
+With a domain of your own, a named Cloudflare tunnel or a server with a certificate works
+the same way: point it at port 8080 and set `WHATSAPP_PUBLIC_URL` to it.

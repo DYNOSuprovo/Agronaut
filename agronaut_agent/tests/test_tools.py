@@ -8,6 +8,13 @@ from agronaut_agent.tools import (
 )
 
 
+def _public(tools):
+    """The core's own tools: an installed add-on (agronaut_twin) appends its tools."""
+    from agronaut_agent.tools import _TWIN_TOOLS
+
+    return [t for t in tools if t not in _TWIN_TOOLS]
+
+
 def test_tool_registry():
     names = {t.name for t in AGRONAUT_TOOLS}
     assert "size_aquaponics_system" in names
@@ -16,7 +23,7 @@ def test_tool_registry():
     assert "remember_about_user" in names
     assert "recommend_actions" in names
     assert "decide_on_recommendations" in names
-    assert len(AGRONAUT_TOOLS) == 30
+    assert len(_public(AGRONAUT_TOOLS)) == 30
 
 
 def test_size_valid_carries_numbers_and_sources():
@@ -168,7 +175,7 @@ def test_registry_includes_update_profile():
     from agronaut_agent.tools import AGRONAUT_TOOLS
     names = {t.name for t in AGRONAUT_TOOLS}
     assert "update_profile" in names
-    assert len(AGRONAUT_TOOLS) == 30
+    assert len(_public(AGRONAUT_TOOLS)) == 30
 
 
 def test_update_profile_writes_canonical_drops_unknown():
@@ -199,7 +206,7 @@ def test_registry_includes_schedule_followup():
     from agronaut_agent.tools import AGRONAUT_TOOLS
     names = {t.name for t in AGRONAUT_TOOLS}
     assert "schedule_followup" in names
-    assert len(AGRONAUT_TOOLS) == 30
+    assert len(_public(AGRONAUT_TOOLS)) == 30
 
 
 def test_schedule_followup_writes_a_row_and_guards_duplicates():
@@ -243,7 +250,7 @@ def test_registry_includes_community_tools():
     names = {t.name for t in AGRONAUT_TOOLS}
     assert "nominate_shared_insight" in names
     assert "search_community_knowledge" in names
-    assert len(AGRONAUT_TOOLS) == 30
+    assert len(_public(AGRONAUT_TOOLS)) == 30
 
 
 def test_nominate_writes_pending_and_rejects_blank():
@@ -294,7 +301,7 @@ def test_registry_includes_record_measurement():
     from agronaut_agent.tools import AGRONAUT_TOOLS
     names = {t.name for t in AGRONAUT_TOOLS}
     assert "record_measurement" in names
-    assert len(AGRONAUT_TOOLS) == 30
+    assert len(_public(AGRONAUT_TOOLS)) == 30
 
 
 def test_record_measurement_maps_metric_to_qualified_key():
@@ -666,3 +673,95 @@ def test_logging_without_a_reading_store_still_works(monkeypatch):
     finally:
         runtime.clear_current()
     assert "Logged." in text
+
+
+def test_update_profile_never_stores_a_value_the_design_gate_rejects():
+    """Standing constraint: inputs the gate rejected are never persisted. A beginner's
+    fuzzy answer goes through update_profile first, so the gate's bounds apply here too."""
+    from agronaut_agent import runtime
+    from agronaut_agent.store import MemoryStore, _Db
+    from agronaut_agent.tools import update_profile
+
+    mem = MemoryStore(_Db(":memory:"))
+    runtime.set_current(mem, "cli:g")
+    try:
+        out = update_profile.invoke({"updates": {
+            "grow_area_m2": 0, "temperature_c": "warm", "crop": "lettuce"}})
+    finally:
+        runtime.clear_current()
+
+    facts = mem.get_facts("cli:g")
+    assert facts.get("crop") == "lettuce"            # the good value is kept
+    assert "grow_area_m2" not in facts and "temperature_c" not in facts
+    assert "VALIDATION_FAILED" in out and "corrected value" in out
+
+
+def test_update_profile_reports_when_everything_was_rejected():
+    from agronaut_agent import runtime
+    from agronaut_agent.store import MemoryStore, _Db
+    from agronaut_agent.tools import update_profile
+
+    mem = MemoryStore(_Db(":memory:"))
+    runtime.set_current(mem, "cli:h")
+    try:
+        out = update_profile.invoke({"updates": {"water_budget_lpd": -5}})
+    finally:
+        runtime.clear_current()
+    assert out.startswith("VALIDATION_FAILED")
+    assert mem.get_facts("cli:h").get("water_budget_lpd") is None
+
+
+# --- a beginner does not know their daily water -------------------------------------------
+
+def test_sizing_runs_without_a_water_budget_and_says_so():
+    """consult_eval, 2026-09-30: with the budget required, the model invented one and
+    presented it as the user's ("well under your 100 L budget")."""
+    from agronaut_agent.tools import size_aquaponics_system
+
+    out = size_aquaponics_system.invoke({"fish_species": "tilapia", "crop": "lettuce",
+                                         "grow_area_m2": 10, "temperature_c": 27})
+    assert "VALIDATION_FAILED" not in out
+    assert "not limiting" in out and "Never quote a budget number" in out
+
+
+def test_a_given_budget_gets_no_water_note():
+    from agronaut_agent.tools import size_aquaponics_system
+
+    out = size_aquaponics_system.invoke({"fish_species": "tilapia", "crop": "lettuce",
+                                         "grow_area_m2": 10, "temperature_c": 27,
+                                         "water_budget_lpd": 300})
+    assert "WATER: no budget" not in out
+
+
+def test_every_sizing_tool_accepts_a_missing_budget_in_its_schema():
+    from agronaut_agent.tools import AGRONAUT_TOOLS
+
+    for t in AGRONAUT_TOOLS:
+        field = t.args.get("water_budget_lpd")
+        if field is not None and t.name != "simulate_season":
+            assert {"type": "null"} in field.get("anyOf", []), t.name
+
+
+def test_the_report_never_prints_the_stand_in_budget():
+    from agronaut_agent.tools import render_design_report
+
+    out = render_design_report.invoke({"fish_species": "tilapia", "crop": "lettuce",
+                                       "grow_area_m2": 10, "temperature_c": 27,
+                                       "water_budget_lpd": None})
+    assert "10000000" not in out and "not given" in out
+
+
+def test_unknown_water_is_a_real_answer_that_stops_the_question():
+    from agronaut_agent import profile, runtime
+    from agronaut_agent.store import MemoryStore, _Db
+    from agronaut_agent.tools import update_profile
+
+    mem = MemoryStore(_Db(":memory:"))
+    runtime.set_current(mem, "cli:w")
+    try:
+        out = update_profile.invoke({"updates": {"water_budget_lpd": "don't know"}})
+    finally:
+        runtime.clear_current()
+    facts = mem.get_facts("cli:w")
+    assert facts["water_budget_lpd"] == "unknown" and "VALIDATION_FAILED" not in out
+    assert "water_budget_lpd" not in profile.missing_essentials("design", facts)

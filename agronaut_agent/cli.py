@@ -13,11 +13,14 @@ owns it, so this module stays a dispatcher and only a dispatcher.
     agronaut doctor                                 # what is configured, and what is broken
     agronaut --version                              # which build is this, and from where
     agronaut update                                 # check PyPI and upgrade
+    agronaut eval                                   # how good is it: retrieval, answers, safety
+    agronaut phoenix                                # optional: full local traces in Phoenix
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -37,11 +40,58 @@ def _cmd_chat(args) -> int:
     return 0
 
 
+_WEB_PORT = 8501          # Streamlit's default, and the address the docs give
+
+
+def _port_free(port: int) -> bool:
+    """Nothing answers on localhost:port, and the port can be bound on every address.
+
+    Both, because binding alone is not enough on macOS: a program listening on 127.0.0.1:8501
+    (a VS Code extension host did, 2026-10-04) does not stop Streamlit binding 0.0.0.0:8501.
+    Streamlit then starts without a word, and the browser's localhost reaches the other
+    program, which never answers: a blank page.
+    """
+    import socket
+
+    with socket.socket() as probe:
+        probe.settimeout(0.3)
+        if probe.connect_ex(("127.0.0.1", port)) == 0:
+            return False
+    with socket.socket() as probe:
+        try:
+            probe.bind(("0.0.0.0", port))
+        except OSError:
+            return False
+    return True
+
+
+def _free_port(start: int = _WEB_PORT, tries: int = 20) -> int | None:
+    return next((p for p in range(start, start + tries) if _port_free(p)), None)
+
+
 def _cmd_web(args) -> int:
     # sys.executable, not a bare "streamlit": the console script is often invoked by
     # absolute path (systemd, cron, another venv's shell) with our bin/ not on PATH.
+    flags = list(args.streamlit_args)
+    # The default port only when it is really free; a port the user names always wins.
+    if not any(f.startswith("--server.port") for f in flags) and not os.getenv(
+            "STREAMLIT_SERVER_PORT"):
+        port = _free_port()
+        if port is None:
+            print(f"Ports {_WEB_PORT} to {_WEB_PORT + 19} are all taken. Pick one: "
+                  "agronaut web --server.port=9000")
+            return 2
+        if port != _WEB_PORT:
+            print(f"Port {_WEB_PORT} is already used by another program, so this starts on "
+                  f"{port}.\nOpen http://localhost:{port}\n", flush=True)
+            flags.insert(0, f"--server.port={port}")
+    # No file watcher unless asked for: it exists to reload on code edits, which a grower
+    # never makes, and walking `transformers` it printed a screenful of torchvision
+    # tracebacks on every start. `streamlit run app.py` (development) keeps it.
+    if not any(f.startswith("--server.fileWatcherType") for f in flags):
+        flags.insert(0, "--server.fileWatcherType=none")
     return subprocess.call([sys.executable, "-m", "streamlit", "run", str(ROOT / "app.py"),
-                            *args.streamlit_args])
+                            *flags])
 
 
 def _cmd_bot(args) -> int:
@@ -56,7 +106,7 @@ def _cmd_setup(args) -> int:
     _root_importable()
     from . import setup_wizard
 
-    return setup_wizard.run()
+    return setup_wizard.run(getattr(args, "section", None))
 
 
 def _cmd_whatsapp(args) -> int:
@@ -70,9 +120,13 @@ def _cmd_whatsapp(args) -> int:
         text, code = doc.report(checks)
         print(text)
         return code
+    if args.token:
+        from . import setup_wizard
+
+        return setup_wizard.replace_whatsapp_token()
     import whatsapp
 
-    return whatsapp.main()
+    return whatsapp.main(tunnel=args.tunnel)
 
 
 def _cmd_review(args) -> int:
@@ -121,6 +175,19 @@ def _cmd_traces(args) -> int:
             print(f"    {e['event']:14s} {bits}")
         print()
     return 0
+
+
+def _cmd_eval(args) -> int:
+    _root_importable()
+    from . import eval_cli
+
+    return eval_cli.main(args)
+
+
+def _cmd_phoenix(args) -> int:
+    from . import otel_phoenix
+
+    return otel_phoenix.serve()
 
 
 def _cmd_doctor(args) -> int:
@@ -184,8 +251,11 @@ def _build_parser() -> argparse.ArgumentParser:
     web.add_argument("streamlit_args", nargs="*",
                      help="e.g. --server.port=9000 --server.headless=true")
     web.set_defaults(func=_cmd_web)
-    sub.add_parser("setup", help="interactive first-time setup (writes your .env)").set_defaults(
-        func=_cmd_setup)
+    st = sub.add_parser("setup", help="set up, or change one part of, your .env "
+                                      "(model, Telegram, WhatsApp)")
+    st.add_argument("section", nargs="?", choices=["model", "telegram", "whatsapp"],
+                    help="jump straight to one part; saved values are kept")
+    st.set_defaults(func=_cmd_setup)
     sub.add_parser("bot", help="run the Telegram bot").set_defaults(func=_cmd_bot)
     wa = sub.add_parser("whatsapp", help="run the WhatsApp webhook (Meta Cloud API)")
     wa.add_argument("--check", action="store_true",
@@ -195,6 +265,12 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="check, and repair the WABA subscription Meta's dashboard hides")
     wa.add_argument("--url", metavar="HTTPS_URL",
                     help="your public webhook URL, to test that Meta can actually reach it")
+    wa.add_argument("--tunnel", action="store_true",
+                    help="also start a cloudflared tunnel and print the Callback URL and "
+                         "verify token to paste into Meta (easiest on a laptop)")
+    wa.add_argument("--token", action="store_true",
+                    help="save a WhatsApp access token, ideally a permanent System User "
+                         "token: paste it hidden, it is checked with Meta, then saved")
     wa.set_defaults(func=_cmd_whatsapp)
     sub.add_parser("doctor", help="check your install, config, provider, corpus and data"
                    ).set_defaults(func=_cmd_doctor)
@@ -208,6 +284,12 @@ def _build_parser() -> argparse.ArgumentParser:
     tr = sub.add_parser("traces", help="show recent turns as pipeline traces")
     tr.add_argument("--limit", type=int, default=10, help="how many recent turns to show")
     tr.set_defaults(func=_cmd_traces)
+    from .eval_cli import add_parser as _add_eval
+    _add_eval(sub)
+    sub.choices["eval"].set_defaults(func=_cmd_eval)
+    sub.add_parser("phoenix", help="run a local Arize Phoenix to see full turn traces "
+                                    "(optional; then run the bot with AGRONAUT_PHOENIX=on)"
+                   ).set_defaults(func=_cmd_phoenix)
     return p
 
 

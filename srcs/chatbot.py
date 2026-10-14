@@ -99,6 +99,11 @@ def parse_urls_file(file_path: str) -> List[Dict[str, str]]:
       CATEGORY|URL
       CATEGORY|URL|LABEL
       CATEGORY|URL|LABEL|LICENCE
+      CATEGORY|URL|LABEL|LICENCE|domain=hydroponics;year=2019;doi=10.3389/fpls.2019.00923
+
+    The optional fifth field carries citation and routing metadata as key=value pairs. Only the
+    keys in URL_META_KEYS are kept; each lands on every chunk of that source, so retrieval can
+    filter or boost by domain and an answer can cite "Author Year" with a DOI.
 
     LICENCE records the terms the text is published under (e.g. "CC BY 4.0", "CC BY-NC-SA 3.0").
     Agronaut is a Digital Public Good, so what it indexes has to be openly licensed — and in
@@ -109,7 +114,7 @@ def parse_urls_file(file_path: str) -> List[Dict[str, str]]:
       URL
 
     Returns list of dicts:
-      {"category": "...", "url": "...", "label": "...", "licence": "..."}
+      {"category": "...", "url": "...", "label": "...", "licence": "...", "meta": {...}}
     """
     p = pathlib.Path(file_path)
     if not p.exists():
@@ -127,6 +132,7 @@ def parse_urls_file(file_path: str) -> List[Dict[str, str]]:
         category = "UNCATEGORIZED"
         label = ""
         licence = ""
+        meta: Dict[str, str] = {}
 
         if "|" in line:
             parts = [x.strip() for x in line.split("|")]
@@ -137,6 +143,8 @@ def parse_urls_file(file_path: str) -> List[Dict[str, str]]:
                     label = parts[2]
                 if len(parts) >= 4:
                     licence = parts[3]
+                if len(parts) >= 5:
+                    meta = parse_url_meta(parts[4])
             else:
                 # Fallback to legacy if the split is malformed
                 url = line
@@ -152,9 +160,36 @@ def parse_urls_file(file_path: str) -> List[Dict[str, str]]:
         seen.add(key)
 
         entries.append({"category": category, "url": url, "label": label,
-                        "licence": licence})
+                        "licence": licence, "meta": meta})
 
     return entries
+
+
+# Metadata a urls.txt line may carry. Closed on purpose: a typo'd key should vanish, not become
+# a field that a handful of chunks carry and a filter then silently excludes everything else by.
+URL_META_KEYS = ("domain", "year", "doi")
+
+
+def parse_url_meta(field: str) -> Dict[str, str]:
+    """`domain=hydroponics;year=2019` -> {"domain": "hydroponics", "year": "2019"}."""
+    out: Dict[str, str] = {}
+    for pair in (field or "").split(";"):
+        key, _, value = pair.partition("=")
+        key, value = key.strip().lower(), value.strip()
+        if key in URL_META_KEYS and value:
+            out[key] = value
+    return out
+
+
+# The domain every hand-written guide belongs to unless it says otherwise with a line like
+# "_Domain: hydroponics_". Most of knowledge/ is aquaponics husbandry.
+DEFAULT_GUIDE_DOMAIN = "aquaponics"
+_GUIDE_DOMAIN_RE = re.compile(r"^_?Domain:\s*([a-z]+(?:_[a-z]+)*)_?\s*$", re.I | re.M)
+
+
+def guide_domain(text: str) -> str:
+    m = _GUIDE_DOMAIN_RE.search(text or "")
+    return m.group(1).lower() if m else DEFAULT_GUIDE_DOMAIN
 
 
 def load_urls_from_file(file_path: str) -> List[str]:
@@ -178,6 +213,7 @@ def load_local_knowledge_documents(knowledge_dir: str = KNOWLEDGE_DIR):
                 d.metadata["source_type"] = "local_file"
                 d.metadata["source_path"] = str(fp)
                 d.metadata["kb_tag"] = fp.stem.lower()
+                d.metadata["domain"] = guide_domain(d.page_content)
             docs.extend(loaded)
         except Exception as err:  # noqa: BLE001
             logging.warning("Failed to load local file %s – %s", fp, err)
@@ -395,10 +431,61 @@ def _pdf_documents(content: bytes, url: str):
             if text:
                 docs.append(Document(page_content=text, metadata={"source": url, "page": n}))
         docs = _clean_pdf_documents(docs)
+        if sentence_chunking_enabled():
+            # After cleaning, not before: the running-header and contents-page checks read the
+            # printed line structure that this removes.
+            for d in docs:
+                d.page_content = _rejoin_printed_lines(d.page_content)
         logging.info("Loaded %d PDF pages from %s", len(docs), url)
         return docs
     except Exception as err:  # noqa: BLE001
         logging.warning("Failed to read PDF %s — %s", url, err)
+        return []
+
+
+def _is_jats(probe: dict) -> bool:
+    return "xml" in probe["content_type"] and b"<article" in probe["content"][:4000]
+
+
+def _jats_documents(content: bytes, url: str):
+    """Text from a JATS XML article (Europe PMC's fullTextXML), one Document per section.
+
+    Publisher PDFs of open-access papers are routinely behind bot walls (MDPI answers 403),
+    while Europe PMC serves the same article as structured XML to anyone. Structure is the
+    point: the reference list, author affiliations, and funding notes are dropped here, where
+    a PDF would hand them to the chunker as body text and they would then answer off-topic
+    queries with a real-looking citation."""
+    try:
+        import warnings
+
+        from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
+        from langchain_core.documents import Document
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", XMLParsedAsHTMLWarning)
+            soup = BeautifulSoup(content, "html.parser")   # stdlib; JATS tags are lowercase
+        for tag in soup.find_all(["ref-list", "back", "contrib-group", "aff", "funding-group",
+                                  "author-notes", "table-wrap-foot", "fn-group", "xref",
+                                  "supplementary-material"]):
+            tag.decompose()
+        docs = []
+        title = soup.find("article-title")
+        abstract = soup.find("abstract")
+        head = " ".join(x.get_text(" ", strip=True) for x in (title, abstract) if x)
+        if head:
+            docs.append(Document(page_content=head, metadata={"source": url, "section": "abstract"}))
+        body = soup.find("body")
+        for sec in (body.find_all("sec", recursive=False) if body else []):
+            heading = sec.find("title")
+            text = " ".join(sec.get_text(" ", strip=True).split())
+            if text:
+                docs.append(Document(page_content=text, metadata={
+                    "source": url,
+                    "section": heading.get_text(" ", strip=True)[:80] if heading else ""}))
+        logging.info("Loaded %d JATS sections from %s", len(docs), url)
+        return docs
+    except Exception as err:  # noqa: BLE001
+        logging.warning("Failed to read JATS XML %s: %s", url, err)
         return []
 
 
@@ -408,6 +495,8 @@ def load_web_page(url: str):
         return []
     if probe["is_pdf"]:
         return _pdf_documents(probe["content"], url)
+    if _is_jats(probe):
+        return _jats_documents(probe["content"], url)
     try:
         logging.info("Loading %s", url)
         loader = WebBaseLoader(url)
@@ -506,11 +595,76 @@ def markdown_headers_enabled() -> bool:
     return os.getenv("AGRONAUT_MD_HEADERS", "").lower() in {"on", "1", "true"}
 
 
-def build_vector_store(documents) -> FAISS:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=CHUNK_SIZE,
-        chunk_overlap=CHUNK_OVERLAP,
-    )
+def sentence_chunking_enabled() -> bool:
+    """Cut extracted sources (PDF, JATS, web) at sentence ends, not wherever a line or a space falls.
+
+    pypdf ends every PRINTED line with a newline, and the default splitter's preference order is
+    paragraph, newline, space: none of them a sentence boundary. On FAO 589, 70.6% of chunks ended
+    mid-sentence and 57.8% started mid-sentence, so the model was handed fragments, sometimes with
+    a number on one side of a cut and what it measures on the other. JATS sections are joined onto
+    one line, so they could only ever break on a space. Rejoining the printed lines and preferring
+    sentence ends took FAO 589 to 17.7% / 6.8%, most of the remainder being page edges (each page
+    is its own Document) and captions that carry no full stop.
+
+    The curated knowledge/ files keep the original splitter, byte for byte: their sections already
+    fit the window, and nothing about them was broken.
+
+    Ships DISABLED, because what the golden set can see did not improve. Full 3940-chunk corpus,
+    re-swept (the only safe floor became 1.55; cap 1 and beta 0.90 held):
+
+        variant                            hit    recall  prec    MRR     MAP    off-topic
+        off, floor 1.50 (shipped)          0.879  0.833   0.364   0.636   0.604  8/10
+        on,  floor 1.55 (re-calibrated)    0.909  0.818   0.343   0.621   0.568  7/10
+
+    Shorter chunks (median 755 -> 625 chars) match every question a little less well, so the worst
+    real query moved from 1.383 to 1.420 and the floor had to rise to keep 0.10 of headroom. At
+    1.55, three off-topic queries (1.470 to 1.487) sit under it, one more than today, and ranking
+    fell. The gain is readability, which a document-level metric cannot score:
+    whether whole sentences make better ANSWERS is for the faithfulness eval to say. It said
+    "probably" (2026-10-03): faithfulness 0.855 -> 0.899, 14 queries better and 6 worse, but
+    p 0.12 on one run per condition. Not enough to pay the MAP and off-topic cost above. Turn it
+    on only together with AGRONAUT_RELEVANCE_MAX_DISTANCE=1.55.
+    """
+    import os
+    return os.getenv("AGRONAUT_SENTENCE_CHUNKS", "").lower() in {"on", "1", "true"}
+
+
+# Sentence ends come after paragraphs and lines (which, once printed lines are rejoined, only
+# survive at a sentence end) and before clause breaks and plain spaces. keep_separator="end"
+# leaves the full stop on the sentence it closes instead of opening the next chunk with it.
+_SENTENCE_SEPARATORS = ["\n\n", "\n", ". ", "? ", "! ", "; ", ", ", " ", ""]
+_SENTENCE_END = re.compile(r"[.!?:][\"')\]”’]*$")
+
+
+def _rejoin_printed_lines(text: str) -> str:
+    """Undo a PDF's line wrapping: one line per sentence run, not one per printed line.
+
+    A line break is kept only where the line ends a sentence, so the splitter's newline separator
+    lands on a sentence end. A word hyphenated across lines is rejoined when the next line starts
+    in lowercase (a typesetting break); a real compound split there loses its hyphen, which costs
+    the embedding less than half a word does.
+    """
+    out: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            if out and out[-1] != "\n\n":
+                out.append("\n\n")
+            continue
+        if not out or out[-1] in ("\n", "\n\n"):
+            out.append(line)
+        elif out[-1].endswith("-") and line[:1].islower():
+            out[-1] = out[-1][:-1] + line
+        elif _SENTENCE_END.search(out[-1]):
+            out += ["\n", line]
+        else:
+            out[-1] = f"{out[-1]} {line}"
+    return "".join(out).strip()
+
+
+def split_into_chunks(documents) -> list:
+    """The chunking pipeline, shared by build_vector_store and scripts/corpus_report so the chunk
+    counts a report prints are the ones the index gets. Boilerplate filtering is left to callers."""
     if markdown_headers_enabled():
         # Header-split the hand-authored corpus first, then let the character splitter handle any
         # section that is still oversized. Web and PDF documents have no reliable heading
@@ -522,7 +676,22 @@ def build_vector_store(documents) -> FAISS:
             else:
                 prepared.append(d)
         documents = prepared
-    docs = splitter.split_documents(documents)
+    plain = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
+    if not sentence_chunking_enabled():
+        return plain.split_documents(documents)
+    sentences = RecursiveCharacterTextSplitter(
+        chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP,
+        separators=_SENTENCE_SEPARATORS, keep_separator="end")
+    # Document by document, so chunks keep the order they had before this flag existed.
+    chunks = []
+    for d in documents:
+        local = d.metadata.get("source_type") == "local_file"
+        chunks.extend((plain if local else sentences).split_documents([d]))
+    return chunks
+
+
+def build_vector_store(documents) -> FAISS:
+    docs = split_into_chunks(documents)
 
     filtered = [d for d in docs if not _is_boilerplate_text(getattr(d, "page_content", ""))]
     if filtered:
@@ -1779,6 +1948,12 @@ INDEX_CACHE_DIR = _paths.cache_dir() / "data" / ".index_cache"
 INDEX_CACHE_TTL = 7 * 86_400   # web sources are re-fetched at most weekly
 
 
+# Bumped when the metadata attached to chunks changes. An index cached under the old schema
+# has the old fields, and a filter on a new one would quietly match nothing.
+#   2: licence, domain, year, doi
+META_SCHEMA = 2
+
+
 def _corpus_fingerprint() -> str:
     """Identity of the corpus AND the parameters that shape it.
 
@@ -1797,7 +1972,10 @@ def _corpus_fingerprint() -> str:
              f"|md_headers={markdown_headers_enabled()}"
              f"|md_crumb={_crumb_enabled()}"
              f"|pdf_clean={pdf_cleaning_enabled()}"
-             f"|pdf_sections={pdf_sections_enabled()}".encode())
+             # Only when on, so the off default leaves every existing cached index valid.
+             f"{'|sentences=True' if sentence_chunking_enabled() else ''}"
+             f"|pdf_sections={pdf_sections_enabled()}"
+             f"|meta_schema={META_SCHEMA}".encode())
     kb = pathlib.Path(KNOWLEDGE_DIR)
     if kb.exists():
         for fp in sorted(kb.rglob("*")):
@@ -1881,6 +2059,10 @@ def build_rag_index_from_urls() -> Optional[FAISS]:
                     d.metadata["url_category"] = entry.get("category", "UNCATEGORIZED")
                     if entry.get("label"):
                         d.metadata["url_label"] = entry["label"]
+                    if entry.get("licence"):
+                        d.metadata["licence"] = entry["licence"]
+                    for key, value in (entry.get("meta") or {}).items():
+                        d.metadata[key] = value
                 documents.extend(loaded_docs)
 
     # Load local knowledge files (knowledge/*.md, *.txt)

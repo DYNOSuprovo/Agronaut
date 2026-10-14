@@ -13,6 +13,9 @@ Needs (in .env or the environment), all from the Meta app dashboard:
   WHATSAPP_VERIFY_TOKEN     any string you invent; paste the same one into Meta's webhook form
   WHATSAPP_APP_SECRET       app secret, used to verify inbound request signatures
   AGRONAUT_ALLOWED_IDS      comma-separated sender numbers allowed to use the bot
+  WHATSAPP_PUBLIC_URL       optional: a permanent https address that reaches this port (for
+                            example a Tailscale Funnel), checked at startup; see
+                            docs/whatsapp_setup.md
 
 Plus a model, the same as Telegram: LLM_PROVIDER=ollama with a pulled model, or a hosted key.
 """
@@ -33,8 +36,10 @@ from agronaut_agent.core import AgronautAgent
 # and this is the setup step people get stuck on.
 REQUIRED = {
     "WHATSAPP_TOKEN":
-        "access token — Meta app dashboard > WhatsApp > API Setup. The temporary one there "
-        "expires in 24 h; generate a permanent token from a System User for anything real.",
+        "access token. Best: a permanent System User token (business.facebook.com > Settings "
+        "> System users > Generate token, expiration Never). The test token from the app's "
+        "Step 1. Try it out can die within an hour. Save either with `agronaut whatsapp "
+        "--token`; docs/whatsapp_setup.md has every screen.",
     "WHATSAPP_PHONE_NUMBER_ID":
         "the SENDER's phone number ID, on the same API Setup page. It is a long number, not "
         "a phone number — do not paste the +country digits.",
@@ -59,7 +64,7 @@ def warnings() -> list[str]:
     return [f"{k} is not set — {why}" for k, why in RECOMMENDED.items() if not os.getenv(k)]
 
 
-def main() -> int:
+def main(tunnel: bool = False) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     log = logging.getLogger("agronaut.whatsapp")
@@ -70,7 +75,7 @@ def main() -> int:
         for p in problems:
             print(f"  - {p}\n", file=sys.stderr)
         print("Put them in a .env file in the project root, then run this again.\n"
-              "Full walkthrough: README, 'Run on WhatsApp (Cloud API)'.", file=sys.stderr)
+              "Full walkthrough: docs/whatsapp_setup.md.", file=sys.stderr)
         return 2
 
     for w in warnings():
@@ -81,9 +86,73 @@ def main() -> int:
                     "number(s) unless you mean to run it open.")
 
     port = int(os.getenv("WHATSAPP_PORT", "8080"))
-    log.info("starting WhatsApp webhook on port %d — Meta must reach it over HTTPS, so "
-             "point a tunnel or reverse proxy at it", port)
+    if tunnel:
+        return _run_with_tunnel(port, log)
+    from agronaut_agent import whatsapp_tunnel as T
+
+    base = T.public_base(os.getenv("WHATSAPP_PUBLIC_URL"))
+    if base:
+        print(T.permanent_card(base), flush=True)
+        _check_in_background(base, log, first_wait=3.0, fix=(
+            f"Is the tunnel up? With Tailscale: `tailscale funnel status` should list "
+            f"http://127.0.0.1:{port}; if not, run `tailscale funnel --bg {port}`."))
+    else:
+        if os.getenv("WHATSAPP_PUBLIC_URL"):
+            log.warning("WHATSAPP_PUBLIC_URL is set but is not an https:// address, so it "
+                        "is ignored")
+        log.info("starting WhatsApp webhook on port %d. Meta must reach it over HTTPS, so "
+                 "point a tunnel or reverse proxy at it (or run `agronaut whatsapp "
+                 "--tunnel` to start one here)", port)
     WhatsAppAdapter(AgronautAgent(), port=port).run()
+    return 0
+
+
+def _check_in_background(base: str, log, first_wait: float, fix: str) -> None:
+    """Send Meta's handshake to the public address once the bot is up, and say what came
+    back, so a dead tunnel shows in the bot's own log instead of as silence on WhatsApp."""
+    import threading
+
+    from agronaut_agent import whatsapp_tunnel as T
+
+    verify = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+
+    def _check():
+        if T.probe_until_reachable(base, verify, first_wait=first_wait):
+            log.info("public address works: %s answers Meta's handshake",
+                     T.webhook_url(base))
+        else:
+            log.warning("%s did not answer Meta's handshake. %s", T.webhook_url(base), fix)
+
+    threading.Thread(target=_check, daemon=True).start()
+
+
+def _run_with_tunnel(port: int, log) -> int:
+    """Bot and public address in one process, and the values Meta needs printed on screen."""
+    from agronaut_agent import whatsapp_tunnel as T
+
+    tun = T.QuickTunnel(port)
+    try:
+        base = tun.start()
+    except T.TunnelUnavailable as err:
+        print(f"\nCould not start the tunnel: {err}\n", file=sys.stderr)
+        return 2
+    print(T.paste_card(base, os.getenv("WHATSAPP_VERIFY_TOKEN", "")), flush=True)
+    # A quick tunnel's name needs a moment to exist; see probe_until_reachable.
+    _check_in_background(base, log, first_wait=15.0, fix=(
+        "That is often only this machine's DNS cache and Meta can reach it anyway: paste it "
+        "and click Verify and save. If Meta also fails, restart this command."))
+    import signal
+
+    # A plain `kill` or a closed terminal sends SIGTERM, which skips `finally` unless it is
+    # turned into an exit: that would leave cloudflared serving a dead address.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    try:
+        WhatsAppAdapter(AgronautAgent(), port=port).run()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        tun.stop()
+        log.info("stopped the bot and the tunnel; the address above no longer works")
     return 0
 
 

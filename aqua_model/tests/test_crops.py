@@ -64,9 +64,11 @@ def test_amaranth_is_the_heat_tolerant_leafy_option():
 
     leafy_above_30 = [k for k, x in CROPS.items()
                       if x.category == "leafy" and x.temp_max_c > 30.0]
-    assert sorted(leafy_above_30) == ["amaranth", "water_spinach"], (
-        "amaranth and water_spinach should be the leafy crops that carry hot climates; "
-        f"if another joins them, widen this assertion deliberately. Found: {leafy_above_30}"
+    assert sorted(leafy_above_30) == ["amaranth", "malabar_spinach", "moringa",
+                                      "water_spinach"], (
+        "amaranth, water_spinach, malabar_spinach (#125) and moringa are the leafy "
+        f"crops that carry hot climates; if another joins them, widen this assertion "
+        f"deliberately. Found: {leafy_above_30}"
     )
 
 
@@ -108,4 +110,103 @@ def test_water_spinach_is_heat_tolerant_and_semi_aquatic():
     assert "FRR placed" in ws.source, "FRR placement must be clearly stated"
     assert ws.yield_kg_per_m2_year > 10.0
     assert ws.yield_kg_per_m2_year < 25.0
+
+
+def test_malabar_spinach_is_heat_tolerant_and_cold_sensitive():
+    """#125: malabar spinach (Basella alba), the sixth of the six wanted crops.
+
+    Its identity in the database is the pairing of a 35 °C ceiling with a 20 °C
+    floor: it carries hot climates the way amaranth and water spinach do, but it
+    is also the leafy entry that most refuses cool weather (poor growth below
+    ~27 °C, UF/IFAS HS1371). If a future edit narrows the band, the reason this
+    crop was added reopens silently.
+    """
+    ms = get_crop("malabar_spinach")
+    assert ms.category == "leafy"
+    assert ms.temp_max_c >= 35.0
+    assert ms.temp_min_c >= 20.0
+    assert "FRR placed" in ms.source, "FRR placement must be clearly stated"
+    assert ms.yield_kg_per_m2_year > 10.0
+    assert ms.yield_kg_per_m2_year < 25.0
+
+
+def test_malabar_spinach_sizes_a_system_without_error():
+    """The acceptance criterion from #125: it has to actually run, not just parse."""
+    from aqua_model import size_system, validate_design_input
+
+    out = size_system(validate_design_input("tilapia", "malabar_spinach", 12.0, 29.0, 3000.0))
+    assert out.feed_g_per_day > 0
+    assert out.fish_count > 0
+    assert out.biofilter_media_m2 > 0
+
+
+def test_moringa_is_heat_tolerant_and_drought_hardy():
+    """#125: moringa (Moringa oleifera), the seventh wanted heat-tolerant leafy.
+
+    Its identity in the database is the pairing of the 35 °C ceiling with the
+    warmest floor of the group (20 °C): a chilling-sensitive tropical species whose
+    cited optimum (25-35 °C, Trigo et al. 2021) sits entirely in the heat. It is
+    also the protein outlier — 9.4 g/100 g fresh against 1.4-2.6 for the rest of
+    the leafies — so an edit that quietly lowers either number breaks the reason
+    this crop was added.
+    """
+    mo = get_crop("moringa")
+    assert mo.category == "leafy"
+    assert mo.temp_max_c >= 35.0
+    assert mo.temp_min_c >= 20.0
+    assert "FRR placed" in mo.source, "FRR placement must be clearly stated"
+    assert mo.edible_protein_pct >= 9.0, (
+        "moringa is here for the protein too; 9.4 g/100 g fresh (USDA FDC) is the point"
+    )
+    assert mo.yield_kg_per_m2_year > 10.0
+    assert mo.yield_kg_per_m2_year < 25.0
+
+
+def test_moringa_sizes_a_system_without_error():
+    """The acceptance criterion from #125: it has to actually run, not just parse."""
+    from aqua_model import size_system, validate_design_input
+
+    out = size_system(validate_design_input("tilapia", "moringa", 12.0, 29.0, 3000.0))
+
+    assert out.feed_g_per_day > 0
+    assert out.fish_count > 0
+    assert out.biofilter_media_m2 > 0
+
+
+def test_ethiopian_kale_is_the_heat_tolerant_brassica():
+    """#125: Ethiopian kale (Brassica carinata), a wanted heat-tolerant leafy.
+
+    Its identity in the database is the pairing of a 30 °C ceiling with a 15 °C
+    floor and no vernalization requirement: the leafy brassica slot (kale,
+    collards, mustard greens all stop at 24-27 °C) filled for warm climates.
+    The 30 ceiling is placed, not measured for the leafy use: ECHO's Mutarda
+    carinata sheet states "Temperature range: 15-20° C" and OMAFRA's Specialty
+    Cropportunities states "Optimal Temperature Range: 20-30˚C" — the 30 is the
+    species optimum, placed on the leafy use. If a future edit narrows the band,
+    the reason this crop was added reopens silently.
+    """
+    ek = get_crop("ethiopian_kale")
+    assert ek.category == "leafy"
+    assert ek.temp_max_c >= 30.0
+    assert ek.temp_min_c >= 15.0
+    assert ek.temp_max_c <= 32.0  # sourced ceiling, not a copy of amaranth's 35
+    assert "FRR placed" in ek.source, "FRR placement must be clearly stated"
+    assert "juncea" in ek.source, "protein figure must name its B. juncea inheritance"
+    assert "Mnzava & Schippers 2007" in ek.source, "PROTA citation must name its authors"
+    assert "3.5 kg/m2 (35 t/ha per crop) x 4x" in ek.source, (
+        "yield chain must state the unit conversion and the multiplier, "
+        "not skip the field-to-registered unit step")
+    assert ek.yield_kg_per_m2_year > 10.0
+    assert ek.yield_kg_per_m2_year < 25.0
+
+
+def test_ethiopian_kale_sizes_a_system_without_error():
+    """The acceptance criterion from #125: it has to actually run, not just parse."""
+    from aqua_model import size_system, validate_design_input
+
+    out = size_system(validate_design_input("tilapia", "ethiopian_kale", 12.0, 29.0, 3000.0))
+
+    assert out.feed_g_per_day > 0
+    assert out.fish_count > 0
+    assert out.biofilter_media_m2 > 0
 

@@ -80,11 +80,28 @@ def check_install() -> list[Check]:
             "commands. Usually a checkout's agronaut.egg-info sitting beside a real install; "
             "`rm -rf agronaut.egg-info` in the checkout clears it."))
 
+    stale = _stale_scripts_package() if install.is_editable else None
+    if stale:
+        out.append(Check(
+            WARN, "a stale `scripts` package sits in site-packages",
+            f"{stale} is left over from an older non-editable install. Anything that imports "
+            "`scripts` without the checkout first on the path gets that old copy (it made the "
+            "web app's Quality page show no answers report, 2026-10-04).",
+            f"remove it: rm -rf {stale}"))
+
     if os.getenv("PYTHONPATH"):
         out.append(Check(
             WARN, "PYTHONPATH is set", f"PYTHONPATH={os.getenv('PYTHONPATH')}",
             "it overrides installed packages, so what you test may not be what you shipped"))
     return out
+
+
+def _stale_scripts_package() -> Path | None:
+    """site-packages/scripts, when the checkout's own scripts/ is meant to be the one."""
+    import sysconfig
+
+    candidate = Path(sysconfig.get_paths()["purelib"]) / "scripts"
+    return candidate if (candidate / "__init__.py").is_file() else None
 
 
 def check_config() -> list[Check]:
@@ -147,16 +164,18 @@ def check_provider() -> list[Check]:
         mod = importlib.import_module(mod_name)
         getattr(mod, attr_name)
     except Exception as err:  # noqa: BLE001 — broken wheel / ImportError / ModuleNotFoundError
+        fix = f"pip install {pip_pkg}" if isinstance(err, ModuleNotFoundError) else f"pip install --force-reinstall {pip_pkg}"
         return [Check(
             FAIL, f"provider {provider} cannot load {mod_name}.{attr_name}",
             f"{type(err).__name__}: {err}",
-            f"pip install {pip_pkg}")]
+            fix)]
 
     out = [Check(OK, f"provider {provider}" + (f", model {model}" if model else ""))]
     if provider == "ollama":
         ok, msg = W.check_ollama()
         out.append(Check(OK if ok else FAIL, f"ollama: {msg}",
                          fix="" if ok else "start it with `ollama serve`"))
+        out.append(_ollama_context_check())
     elif provider == "anthropic":
         key = (os.getenv("ANTHROPIC_API_KEY") or "").strip()
         if not key:
@@ -170,6 +189,25 @@ def check_provider() -> list[Check]:
         out.append(Check(SKIP, f"reachability of {provider} not checked",
                          "doctor only probes ollama and anthropic so far"))
     return out
+
+
+def _ollama_context_check() -> Check:
+    """The context window Agronaut will ask Ollama for, and whether the prompt fits it (#181).
+
+    Below OLLAMA_MIN_NUM_CTX, Ollama cuts the middle out of the prompt without an error:
+    the reply still arrives, it was just written without most of its instructions.
+    """
+    from agent.llm import DEFAULT_OLLAMA_NUM_CTX, OLLAMA_MIN_NUM_CTX, ollama_num_ctx
+
+    ctx = ollama_num_ctx()
+    if ctx < OLLAMA_MIN_NUM_CTX:
+        return Check(WARN, f"ollama context {ctx} tokens is smaller than Agronaut's prompt",
+                     "the system prompt and tools alone are about 11K tokens, so Ollama will "
+                     "silently drop the middle of every prompt, instructions included",
+                     f"raise AGRONAUT_OLLAMA_NUM_CTX to at least {OLLAMA_MIN_NUM_CTX} "
+                     f"(default {DEFAULT_OLLAMA_NUM_CTX})")
+    return Check(OK, f"ollama context {ctx} tokens",
+                 "enough for the prompt and a conversation; lower it only if memory runs out")
 
 
 def check_knowledge() -> list[Check]:
@@ -211,7 +249,10 @@ def check_validation_record() -> list[Check]:
         return [Check(FAIL, "the validation record did not ship",
                       "every projection will disclaim itself as unmeasured",
                       "reinstall: pip install --force-reinstall agronaut")]
-    return [Check(OK, "validation record present", first[:88])]
+    # Printed whole. It used to be cut at 88 characters, which stopped mid-sentence at "It beat
+    # both a flat and a tren" and dropped the "0 of 7" that followed: truncation turned the
+    # record's result into its opposite. The count is the point of the line, so it never gets cut.
+    return [Check(OK, "validation record present", first)]
 
 
 def check_database() -> list[Check]:
@@ -235,7 +276,13 @@ def check_database() -> list[Check]:
 
 
 def check_channels() -> list[Check]:
-    """Telegram and WhatsApp, only as far as their configuration goes."""
+    """Telegram and WhatsApp, verified as far as their credentials allow.
+
+    Like the Telegram branch, the WhatsApp token is probed against its live API
+    (the same Graph call `agronaut whatsapp --check` starts with): "configured"
+    and "working" are different words, and an expired test token (they can die within
+    the hour) must read as a failure here, not as a pass.
+    """
     out: list[Check] = []
     token = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
     if not token:
@@ -252,9 +299,87 @@ def check_channels() -> list[Check]:
     if not (os.getenv("WHATSAPP_TOKEN") or "").strip():
         out.append(Check(SKIP, "WhatsApp not configured", "no WHATSAPP_TOKEN"))
     else:
-        out.append(Check(OK, "WhatsApp is configured",
-                         "run `agronaut whatsapp --check` for the full chain"))
+        from . import whatsapp_doctor as wd
+
+        phone_id = (os.getenv("WHATSAPP_PHONE_NUMBER_ID") or "").strip()
+        wa_token = (os.getenv("WHATSAPP_TOKEN") or "").strip()
+        if not phone_id:
+            out.append(Check(WARN, "WhatsApp: configured, not verified",
+                             "WHATSAPP_PHONE_NUMBER_ID is not set",
+                             "copy the phone number id from WhatsApp > API Setup"))
+            return out
+        status, body = wd._get(
+            f"{wd.GRAPH}/{phone_id}?fields=display_phone_number,verified_name", wa_token)
+        if status == 0 or status == 429 or status >= 500:
+            out.append(Check(WARN, "WhatsApp: configured, not verified", wd._err(body),
+                             "check connectivity and retry `agronaut doctor`"))
+        elif status in (401, 403):
+            out.append(Check(
+                wd.FAIL, "WhatsApp: token rejected by the Graph API",
+                wd._err(body),
+                "make a permanent System User token (expiration Never) and save it with "
+                "`agronaut whatsapp --token`; docs/whatsapp_setup.md has the steps"))
+        elif status != 200:
+            out.append(Check(
+                wd.FAIL, "WhatsApp: the Graph API rejected the check",
+                wd._err(body),
+                "usually a wrong WHATSAPP_PHONE_NUMBER_ID — copy it from WhatsApp > API Setup"))
+        else:
+            out.append(Check(
+                wd.OK, "WhatsApp: token accepted",
+                "run `agronaut whatsapp --check` for the full chain"))
     return out
+
+
+def check_tracing() -> list[Check]:
+    """Optional full-content tracing to a local Phoenix (otel_phoenix.py).
+
+    Off is the normal state and passes. On, three things must hold for a trace to arrive:
+    the endpoint is on this machine, the client libraries are installed, and the server is
+    up. A server that is down is a warning, not a failure: the bot still answers, the
+    traces are just dropped, and the operator should hear that from here.
+    """
+    import importlib.util
+    import shutil
+    import urllib.request
+    from urllib.parse import urlparse
+
+    from . import otel_phoenix as P
+
+    def _has(module: str) -> bool:
+        # find_spec on a submodule imports its parent, and raises when the parent is absent
+        try:
+            return importlib.util.find_spec(module) is not None
+        except (ImportError, ValueError):
+            return False
+
+    libs = all(_has(m) for m in ("phoenix.otel", "openinference.instrumentation.langchain"))
+    server = shutil.which("phoenix")
+    if not P.requested():
+        have = ("client libraries and server installed: AGRONAUT_PHOENIX=on to use them"
+                if libs and server else "optional: see docs/evaluation.md, 'every word of a turn'")
+        return [Check(OK, "Phoenix tracing off",
+                      f"turns are recorded as shapes only (agronaut traces); {have}")]
+    url = P.endpoint()
+    if not P.is_local(url) and os.getenv("AGRONAUT_PHOENIX_ALLOW_REMOTE", "") != "1":
+        return [Check(FAIL, "Phoenix tracing on, but the endpoint is not this machine",
+                      f"{url}: traces hold growers' messages, so Agronaut refuses to send them",
+                      "point AGRONAUT_PHOENIX_ENDPOINT at 127.0.0.1, or set "
+                      "AGRONAUT_PHOENIX_ALLOW_REMOTE=1 if you mean it")]
+    if not libs:
+        return [Check(FAIL, "Phoenix tracing on, but the client libraries are missing",
+                      "no trace will be sent", P.INSTALL_HINT)]
+    parts = urlparse(url)
+    ui = f"{parts.scheme}://{parts.netloc}/"
+    try:
+        with urllib.request.urlopen(ui, timeout=2):
+            pass
+    except Exception:  # noqa: BLE001 (down is an answer, not a crash)
+        return [Check(WARN, "Phoenix tracing on, but no server is answering",
+                      f"nothing at {ui}: the bot still works, its traces are dropped",
+                      "start it: agronaut phoenix" if server else
+                      "install the server: uv tool install arize-phoenix, then agronaut phoenix")]
+    return [Check(OK, "Phoenix tracing on", f"full turn traces go to {ui} (this machine)")]
 
 
 _GROUPS = (
@@ -266,6 +391,7 @@ _GROUPS = (
     ("validation record", check_validation_record),
     ("database", check_database),
     ("channels", check_channels),
+    ("tracing", check_tracing),
 )
 
 
@@ -292,8 +418,8 @@ def report(checks: list[Check]) -> tuple[str, int]:
     # is entitled to claim is a separate question, answered by data/twin_validation.json, and
     # a report that read as a clean bill of health for the whole system would undo the thing
     # this project is careful about everywhere else.
-    lines.append("This checks your setup, not the accuracy of the advice. "
-                 "For that, see data/twin_validation.json.")
+    lines.append("This checks your setup, not the accuracy of the advice. For that: "
+                 "agronaut eval, and data/twin_validation.json.")
     return "\n".join(lines), (1 if failed else 0)
 
 

@@ -29,11 +29,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from langchain_text_splitters import RecursiveCharacterTextSplitter  # noqa: E402
-
 from srcs.chatbot import (  # noqa: E402
-    CHUNK_OVERLAP,
-    CHUNK_SIZE,
     KNOWLEDGE_DIR,
     URL_FILE,
     WEB_LOAD_TIMEOUT,
@@ -42,6 +38,7 @@ from srcs.chatbot import (  # noqa: E402
     _probe_url,
     load_web_page,
     parse_urls_file,
+    split_into_chunks,
 )
 
 # Words that carry no topic signal, so their presence in a LABEL proves nothing about whether
@@ -120,7 +117,10 @@ def _fetch_http_metadata(url: str) -> dict:
             m = re.search(r"<title[^>]*>(.*?)</title>", r.text, re.S | re.I)
             if m:
                 title = re.sub(r"\s+", " ", m.group(1)).strip()[:200]
-        licence = detect_licence(r.text) if "html" in ctype.lower() else ""
+        # JATS XML (Europe PMC full text) declares its licence as a creativecommons.org link,
+        # exactly like an HTML page, so the same detector reads both.
+        markup = "html" in ctype.lower() or "xml" in ctype.lower()
+        licence = detect_licence(r.text) if markup else ""
         return {"status": str(r.status_code), "final_url": r.url, "title": title,
                 "content_type": ctype.split(";")[0], "licence": licence}
     except Exception as exc:
@@ -145,8 +145,7 @@ def _split(documents) -> int:
     minus the embedding step."""
     if not documents:
         return 0
-    splitter = RecursiveCharacterTextSplitter(chunk_size=CHUNK_SIZE, chunk_overlap=CHUNK_OVERLAP)
-    return sum(1 for d in splitter.split_documents(documents)
+    return sum(1 for d in split_into_chunks(documents)
                if not _is_boilerplate_text(getattr(d, "page_content", "")))
 
 
@@ -234,6 +233,8 @@ def _audit_url(entry: dict) -> dict:
 def _audit_local(path: Path) -> dict:
     from langchain_community.document_loaders import TextLoader
     docs = TextLoader(str(path), encoding="utf-8").load()
+    for d in docs:
+        d.metadata["source_type"] = "local_file"   # as srcs/chatbot.py tags it; picks the splitter
     return {
         "kind": "local", "source": str(path.relative_to(Path(KNOWLEDGE_DIR).parent)),
         "label": "", "category": "LOCAL", "status": "200", "final_url": "", "title": "",

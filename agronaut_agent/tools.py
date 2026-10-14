@@ -28,11 +28,52 @@ from aqua_model import (
 from aqua_model.crops import CROPS
 from aqua_model.reference_data import reference_path
 from aqua_model.species import SPECIES, get_species
+from aqua_model.validate import WATER_NOT_LIMITING, check_design_field
 
 from . import profile as profile_mod
 from . import rag, runtime, serialize, twin_view
 
 log = logging.getLogger(__name__)
+
+
+# What an operator says when they do not know their daily water. Stored as "unknown" in the
+# profile so the consultation stops asking, and mapped to WATER_NOT_LIMITING for sizing.
+_UNKNOWN_WATER = {"unknown", "not sure", "dont know", "don't know", "none", "null", "n/a", ""}
+
+_WATER_NOTE = (
+    "\nWATER: no budget was given, so water was treated as not limiting (any budget figure "
+    "above is a stand-in, not theirs). Tell the user the makeup water this design needs per "
+    "day and ask whether their source can supply it, dry months included. Never quote a "
+    "budget number to them.")
+
+
+def _water_unknown(value) -> bool:
+    return value is None or str(value).strip().lower() in _UNKNOWN_WATER
+
+
+def _water_optional(fn):
+    """Let a sizing tool run when the operator does not know their daily water.
+
+    A beginner cannot answer "litres per day", and a required number made the model invent
+    one ("well under your 100 L budget", measured in consult_eval on 2026-09-30). A missing
+    or "unknown" budget becomes WATER_NOT_LIMITING, and the result says so."""
+    import functools
+    import inspect
+
+    sig = inspect.signature(fn)
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        bound = sig.bind_partial(*args, **kwargs)
+        unknown = _water_unknown(bound.arguments.get("water_budget_lpd"))
+        if unknown:
+            bound.arguments["water_budget_lpd"] = WATER_NOT_LIMITING
+        out = fn(*bound.args, **bound.kwargs)
+        if unknown and isinstance(out, str) and not any(
+                m in out for m in profile_mod._TOOL_FAILURE_MARKERS):
+            out += _WATER_NOTE
+        return out
+    return wrapper
 
 
 def _calibration_note(user_id, species=None, crop=None) -> str:
@@ -66,12 +107,13 @@ def _clean_optional(text: str | None) -> str | None:
 
 
 @tool
+@_water_optional
 def size_aquaponics_system(
     fish_species: str,
     crop: str,
     grow_area_m2: float,
     temperature_c: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None = None,
     source_water_note: str | None = None,
     system_type: str = "raft",
 ) -> str:
@@ -85,7 +127,8 @@ def size_aquaponics_system(
         like tomato, cucumber, strawberry). Call list_supported_species_and_crops if unsure.
     grow_area_m2: planted area (the anchor).
     temperature_c: mean water temperature.
-    water_budget_lpd: makeup water available per day, litres.
+    water_budget_lpd: makeup water available per day, litres. Leave it out (null)
+        when the user does not know; water is then treated as not limiting.
     source_water_note: optional salinity/quality caveat.
     system_type: the GROWING METHOD, matching the user's preference: 'raft' (deep-water
         culture, the default — forgiving, high water volume), 'nft' (nutrient film — light,
@@ -117,11 +160,12 @@ def size_aquaponics_system(
 
 
 @tool
+@_water_optional
 def size_hydroponic_system_tool(
     crop: str,
     grow_area_m2: float,
     temperature_c: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None = None,
     source_water_note: str | None = None,
     system_type: str = "raft",
 ) -> str:
@@ -134,7 +178,8 @@ def size_hydroponic_system_tool(
     crop: one of the supported crops (call list_supported_species_and_crops if unsure).
     grow_area_m2: planted area (the anchor).
     temperature_c: mean ambient/solution temperature.
-    water_budget_lpd: makeup water available per day, litres.
+    water_budget_lpd: makeup water available per day, litres. Leave it out (null)
+        when the user does not know; water is then treated as not limiting.
     source_water_note: optional salinity/quality caveat.
     system_type: growing method — 'raft' (deep-water culture, default), 'nft' (nutrient
         film — light, low water), or 'media_bed'. Match the user's preference.
@@ -150,11 +195,12 @@ def size_hydroponic_system_tool(
 
 
 @tool
+@_water_optional
 def size_mixed_bed_aquaponics(
     fish_species: str,
     crop_plan: list[dict],
     temperature_c: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None = None,
     source_water_note: str | None = None,
     system_type: str = "raft",
 ) -> str:
@@ -171,7 +217,8 @@ def size_mixed_bed_aquaponics(
         crop. Each crop must be supported (call list_supported_species_and_crops if unsure); each
         area must be > 0. The total grow area is their sum.
     temperature_c: mean water temperature.
-    water_budget_lpd: makeup water available per day, litres.
+    water_budget_lpd: makeup water available per day, litres. Leave it out (null)
+        when the user does not know; water is then treated as not limiting.
     source_water_note: optional salinity/quality caveat.
     system_type: the GROWING METHOD — 'raft' (default), 'nft', or 'media_bed' — matching the
         user's preference, exactly as in size_aquaponics_system.
@@ -199,10 +246,11 @@ def size_mixed_bed_aquaponics(
 
 
 @tool
+@_water_optional
 def optimize_fish_crop_ratio(
     grow_area_m2: float,
     temperature_c: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None = None,
     objective: str = "water_efficiency",
 ) -> str:
     """Search fish species x crop-area allocations for the best ratio under a goal, by
@@ -264,12 +312,13 @@ def design_envelope_reality_check(model_envelope: dict) -> str:
 
 
 @tool
+@_water_optional
 def render_design_report(
     fish_species: str,
     crop: str,
     grow_area_m2: float,
     temperature_c: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None = None,
     site: str | None = None,
 ) -> str:
     """Render a full Markdown build report (BOM, envelope, maintenance, cited coefficients,
@@ -286,12 +335,13 @@ def render_design_report(
 
 
 @tool
+@_water_optional
 def render_pilot_proposal(
     fish_species: str,
     crop: str,
     grow_area_m2: float,
     temperature_c: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None,
     site: str,
     organization: str,
     ask_amount: float,
@@ -321,11 +371,12 @@ def render_pilot_proposal(
 
 
 @tool
+@_water_optional
 def render_system_schematic(
     crop: str,
     grow_area_m2: float,
     temperature_c: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None = None,
     fish_species: str | None = None,
     system_type: str = "raft",
 ) -> str:
@@ -364,7 +415,15 @@ def render_system_schematic(
 def search_knowledge_base(query: str) -> str:
     """Retrieve passages from Agronaut's curated aquaponics knowledge (local docs + cited
     sources) for qualitative troubleshooting and husbandry guidance (symptoms, water
-    quality, pests). Use for explanation — NOT for sizing numbers (use the sizing tool)."""
+    quality, pests). Use for explanation — NOT for sizing numbers (use the sizing tool).
+
+    The knowledge is in English and matched by meaning, so write `query` in ENGLISH whatever
+    language the grower wrote in. Keep their symptom in plain English words, and add the
+    textbook term when you know it ("fish gasping at the surface at dawn, low dissolved
+    oxygen"). Still reply to the grower in their own language."""
+    # #199: the embedder and BM25 are English-only. A French or Mandarin query passed through
+    # unchanged hit 0.18 / 0.09 against English's 0.88, and the floor silenced 19 of 33 real
+    # questions in each (docs/dpg/retrieval_eval/baseline_multilingual.json).
     text, stats = rag.search_with_stats(query)
     try:
         from .analytics import Analytics
@@ -437,10 +496,22 @@ def update_profile(updates: dict) -> str:
     rejected = [k for k in updates if k not in profile_mod.PROFILE_KEYS]
     if rejected:
         log.debug("update_profile dropped unknown keys: %s", rejected)
+    # The design gate's bounds apply here too: an input the gate would reject is never
+    # stored, so it cannot sit in memory and resurface in a later turn.
+    if "water_budget_lpd" in accepted and _water_unknown(accepted["water_budget_lpd"]):
+        accepted["water_budget_lpd"] = "unknown"    # a real answer: stop asking for it
+    problems = {k: err for k in list(accepted)
+                if accepted[k] != "unknown"
+                and (err := check_design_field(k, accepted[k])) is not None}
+    for k in problems:
+        accepted.pop(k)
+    refused = ("VALIDATION_FAILED, not saved: " + "; ".join(problems.values())
+               + ". Ask the user for a corrected value.") if problems else ""
     if not accepted:
-        return "No recognized profile fields to save."
+        return refused or "No recognized profile fields to save."
     mem.set_facts(user_id, accepted, source="user_stated")
-    return "Saved to your profile: " + ", ".join(f"{k}={v}" for k, v in accepted.items())
+    saved = "Saved to your profile: " + ", ".join(f"{k}={v}" for k, v in accepted.items())
+    return saved + (f"\n{refused}" if refused else "")
 
 
 @tool
@@ -811,12 +882,13 @@ def what_if_nitrogen(
 
 
 @tool
+@_water_optional
 def design_system_3d(
     fish_species: str,
     crop: str,
     grow_area_m2: float,
     temperature_c: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None = None,
     system_type: str = "raft",
 ) -> str:
     """DESIGN the full system and send the user an interactive 3D model of it — greenhouse,
@@ -956,12 +1028,13 @@ def show_my_system_3d(days_ahead: int = 14, greenhouse: str = "poly") -> str:
 
 
 @tool
+@_water_optional
 def estimate_system_cost(
     fish_species: str,
     crop: str,
     grow_area_m2: float,
     temperature_c: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None,
     region: str,
     system_type: str = "raft",
     greenhouse: str = "poly",
@@ -1009,12 +1082,13 @@ def estimate_system_cost(
 
 
 @tool
+@_water_optional
 def design_full_system(
     fish_species: str,
     crop: str,
     grow_area_m2: float,
     temperature_c: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None = None,
     system_type: str = "raft",
     reliable_power: bool = True,
     wants_max_nutrient_reuse: bool = False,
@@ -1137,9 +1211,11 @@ def fetch_site_climate(place: str) -> str:
                                 "location": f"{h['name']}, {h.get('country', '')}".strip(", ")},
                       source="user_stated")
     return (f"Fetched {r['n_days']} days of {year} weather for {h['name']}, "
-            f"{h.get('country', '?')} (air {r['t_min']:.0f}-{r['t_max']:.0f} C). "
-            f"Site slug: {slug} — saved to the profile; use it as `site` in "
-            f"simulate_season / simulate_my_system / business_case.")
+            f"{h.get('country', '?')} (daily mean air {r['t_min']:.0f} to {r['t_max']:.0f} C"
+            + (f", annual mean {r['t_avg']:.0f} C, a starting estimate for an unheated "
+               f"system's water temperature" if "t_avg" in r else "")
+            + f"). Site slug: {slug}, saved to the profile; use it as `site` in "
+              f"simulate_season / simulate_my_system / business_case.")
 
 
 _TWIN_STATE_KEY = "twin_state_json"
@@ -1535,11 +1611,12 @@ def _format_decision(result: dict, *, approve: bool) -> str:
 
 
 @tool
+@_water_optional
 def business_case(
     fish_species: str,
     crop: str,
     grow_area_m2: float,
-    water_budget_lpd: float,
+    water_budget_lpd: float | None,
     region: str,
     site: str,
     system_type: str = "raft",
@@ -1659,3 +1736,10 @@ AGRONAUT_TOOLS = [
     search_community_knowledge,
     record_measurement,
 ]
+
+# Optional private add-on (Agronaut Twin): its tools join the agent only when installed.
+try:
+    from agronaut_twin.agent_tools import TOOLS as _TWIN_TOOLS
+except ImportError:
+    _TWIN_TOOLS = []
+AGRONAUT_TOOLS += _TWIN_TOOLS

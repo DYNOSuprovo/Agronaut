@@ -8,8 +8,10 @@ import hashlib
 import hmac
 import json
 
+import pytest
+
 from agronaut_agent.channels import base
-from agronaut_agent.channels.whatsapp_adapter import WhatsAppAdapter
+from agronaut_agent.channels.whatsapp_adapter import WhatsAppAdapter, WhatsAppSendError
 
 
 class _FakeAgent:
@@ -76,6 +78,26 @@ def test_verify_handshake_returns_challenge_on_match():
     a = _adapter()
     assert a.verify_webhook("subscribe", "myverify", "CH4LL3NGE") == "CH4LL3NGE"
     assert a.verify_webhook("subscribe", "wrong", "CH4LL3NGE") is None
+
+
+# --- why a verify token was refused (never what it was) -------------------------------------
+
+@pytest.mark.parametrize("received, says", [
+    ("", "empty"),
+    (" myverify ", "spaces"),
+    ("MYVERIFY", "capitals"),
+    ("EAAGm0PX4ZCpsBAAtoken", "ACCESS token"),
+    ("an-old-token-from-setup", "23 characters"),
+])
+def test_a_refused_token_is_explained(received, says):
+    assert says in _adapter().describe_token_mismatch(received)
+
+
+def test_the_explanation_never_contains_either_token():
+    a = _adapter()
+    for received in ("an-old-token-from-setup", "EAAGm0PX4ZCpsBAAtoken", " myverify "):
+        msg = a.describe_token_mismatch(received)
+        assert received.strip() not in msg and "myverify" not in msg
 
 
 def test_parse_incoming_extracts_sender_and_text():
@@ -148,6 +170,212 @@ def test_handle_payload_sends_schematic_attachment(monkeypatch, tmp_path):
     assert sent_media == [("15551234567", str(png))]        # image sent after the text
 
 
+def test_handle_payload_skips_html_attachment_and_explains_availability(monkeypatch, tmp_path):
+    html_file = tmp_path / "scene.html"
+    html_file.write_text("<!DOCTYPE html><html><body>3D Scene</body></html>", encoding="utf-8")
+    agent = _FakeAgent(attachments=[str(html_file)])
+    a = _adapter(agent)
+    sent_media = []
+    sent_text = []
+    monkeypatch.setattr(a, "send_text", lambda to, text: sent_text.append((to, text)))
+    monkeypatch.setattr(
+        a, "send_media",
+        lambda to, path, **kw: sent_media.append((to, path, kw.get("mime"))) or True,
+    )
+
+    a.handle_payload(_incoming_payload("show 3d scene"))
+    assert sent_media == []  # HTML upload is skipped for WhatsApp
+    assert any("3d view isn't available on whatsapp yet" in text.lower() for _, text in sent_text)
+    assert any("telegram has it" in text.lower() for _, text in sent_text)
+    assert not html_file.exists()  # verified finally block unlinks the temp file
+
+
+def test_handle_payload_sends_document_attachment_with_guessed_mime(monkeypatch, tmp_path):
+    pdf_file = tmp_path / "report.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4")
+    agent = _FakeAgent(attachments=[str(pdf_file)])
+    a = _adapter(agent)
+    sent_media = []
+    monkeypatch.setattr(a, "send_text", lambda to, text: None)
+    monkeypatch.setattr(
+        a, "send_media",
+        lambda to, path, **kw: sent_media.append((to, path, kw.get("mime"))) or True,
+    )
+
+    a.handle_payload(_incoming_payload("get report"))
+    assert sent_media == [("15551234567", str(pdf_file), "application/pdf")]
+
+
+def test_handle_payload_sends_png_attachment_with_png_mime(monkeypatch, tmp_path):
+    png_file = tmp_path / "diagram.png"
+    png_file.write_bytes(b"\x89PNG\r\n\x1a\n")
+    agent = _FakeAgent(attachments=[str(png_file)])
+    a = _adapter(agent)
+    sent_media = []
+    monkeypatch.setattr(a, "send_text", lambda to, text: None)
+    monkeypatch.setattr(
+        a, "send_media",
+        lambda to, path, **kw: sent_media.append((to, path, kw.get("mime"))) or True,
+    )
+
+    a.handle_payload(_incoming_payload("draw diagram"))
+    assert sent_media == [("15551234567", str(png_file), "image/png")]
+
+
+def test_flush_attachments_notifies_user_on_send_failure(monkeypatch, tmp_path):
+    pdf_file = tmp_path / "report.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4")
+    agent = _FakeAgent(attachments=[str(pdf_file)])
+    a = _adapter(agent)
+    sent_text = []
+    monkeypatch.setattr(a, "send_text", lambda to, text: sent_text.append((to, text)))
+    monkeypatch.setattr(a, "send_media", lambda to, path, **kw: False)
+
+    a._flush_attachments("15551234567", "15551234567")
+    assert len(sent_text) == 1
+    assert "couldn't send" in sent_text[0][1].lower()
+    assert "report.pdf" in sent_text[0][1]
+    assert "—" not in sent_text[0][1]  # house style avoids em dash
+
+
+def test_flush_attachments_notifies_user_on_send_exception(monkeypatch, tmp_path):
+    pdf_file = tmp_path / "report.pdf"
+    pdf_file.write_bytes(b"%PDF-1.4")
+    agent = _FakeAgent(attachments=[str(pdf_file)])
+    a = _adapter(agent)
+    sent_text = []
+    monkeypatch.setattr(a, "send_text", lambda to, text: sent_text.append((to, text)))
+
+    def _raise(*args, **kwargs):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(a, "send_media", _raise)
+
+    a._flush_attachments("15551234567", "15551234567")
+    assert len(sent_text) == 1
+    assert "couldn't send" in sent_text[0][1].lower()
+    assert "report.pdf" in sent_text[0][1]
+    assert "—" not in sent_text[0][1]
+
+
+def test_flush_attachments_survives_the_network_being_down(monkeypatch, tmp_path):
+    """Every attachment is tried and every temp file deleted, even when the failure notice
+    cannot be sent either. The notice used to raise out of the loop, so the files after the
+    first failure were never tried and stayed on disk (the #124 leak by another door)."""
+    import requests
+
+    files = [tmp_path / "schematic.png", tmp_path / "scene.html", tmp_path / "plan.pdf"]
+    for f in files:
+        f.write_bytes(b"x")
+    a = _adapter(_FakeAgent(attachments=[str(f) for f in files]))
+    posts = []
+
+    def _down(*args, **kwargs):
+        posts.append(args[0])
+        raise requests.ConnectionError("network down")
+
+    monkeypatch.setattr("requests.post", _down)
+
+    a._flush_attachments("15551234567", "15551234567")  # must not raise
+
+    assert [f.name for f in files if f.exists()] == []
+    uploads = [u for u in posts if u.endswith("/media")]
+    assert len(uploads) == 2, "the PDF after the failed PNG was never tried"
+
+
+def test_slash_command_document_failure_notice_does_not_raise(monkeypatch, tmp_path):
+    a = _adapter()
+
+    def _raise(to, text):
+        raise RuntimeError("network down")
+
+    monkeypatch.setattr(a, "send_text", _raise)
+    a._notify_send_failed("15551234567", str(tmp_path / "export.json"))  # must not raise
+
+
+def test_send_media_posts_document_payload_for_html(monkeypatch, tmp_path):
+    html_file = tmp_path / "scene.html"
+    html_file.write_text("<html><body>3D model</body></html>", encoding="utf-8")
+    a = _adapter()
+    posts = []
+
+    class _Resp:
+        def __init__(self, status_code=200, payload=None):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = ""
+
+        def json(self):
+            return self._payload
+
+    def _fake_post(url, headers=None, files=None, data=None, json=None, timeout=None):
+        posts.append({"url": url, "headers": headers, "files": files, "data": data, "json": json})
+        if "/media" in url:
+            return _Resp(200, {"id": "DOC_MEDIA_123"})
+        return _Resp(200, {"messages": [{"id": "wamid.DOC"}]})
+
+    monkeypatch.setattr("requests.post", _fake_post)
+    ok = a.send_media("15551234567", str(html_file), mime="text/html")
+    assert ok is True
+    assert len(posts) == 2
+
+    # Check upload call
+    upload_call = posts[0]
+    assert upload_call["url"].endswith("/media")
+    assert upload_call["data"]["type"] == "text/html"
+    assert upload_call["files"]["file"][0] == "scene.html"
+    assert upload_call["files"]["file"][2] == "text/html"
+
+    # Check messages call
+    msg_call = posts[1]
+    assert msg_call["url"].endswith("/messages")
+    assert msg_call["json"]["type"] == "document"
+    assert msg_call["json"]["document"]["id"] == "DOC_MEDIA_123"
+    assert msg_call["json"]["document"]["filename"] == "scene.html"
+
+
+def test_send_media_returns_false_on_media_upload_failure(monkeypatch, tmp_path):
+    html_file = tmp_path / "scene.html"
+    html_file.write_text("<html></html>", encoding="utf-8")
+    a = _adapter()
+
+    class _Resp:
+        status_code = 400
+        text = '{"error": {"message": "Invalid MIME type"}}'
+
+        def json(self):
+            return {}
+
+    monkeypatch.setattr("requests.post", lambda *args, **kw: _Resp())
+    assert a.send_media("15551234567", str(html_file), mime="text/html") is False
+
+
+def test_send_media_returns_false_on_message_send_failure(monkeypatch, tmp_path):
+    html_file = tmp_path / "scene.html"
+    html_file.write_text("<html></html>", encoding="utf-8")
+    a = _adapter()
+    calls = []
+
+    class _Resp:
+        def __init__(self, status_code=200, payload=None, text=""):
+            self.status_code = status_code
+            self._payload = payload or {}
+            self.text = text
+
+        def json(self):
+            return self._payload
+
+    def _fake_post(url, **kw):
+        calls.append(url)
+        if "/media" in url:
+            return _Resp(200, {"id": "DOC123"})
+        return _Resp(400, text='{"error": "recipient cannot receive documents"}')
+
+    monkeypatch.setattr("requests.post", _fake_post)
+    assert a.send_media("15551234567", str(html_file), mime="text/html") is False
+    assert len(calls) == 2
+
+
 def test_deliver_due_followups_sends_and_marks(monkeypatch):
     agent = _FakeAgent()
     a = _adapter(agent)
@@ -156,6 +384,53 @@ def test_deliver_due_followups_sends_and_marks(monkeypatch):
     a.deliver_due_followups()
     assert sent == [("15551234567", "did it work?")]
     assert ("sent", 1) in agent.calls
+
+
+def test_send_text_raises_on_http_error(monkeypatch):
+    # The follow-up loop marks a question sent unless send_text raises; an HTTP
+    # error used to be logged and swallowed, so failures were recorded as sent.
+    a = _adapter()
+
+    class _Resp:
+        status_code = 400
+        text = '{"error": {"message": "bad request"}}'
+
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: _Resp())
+    with pytest.raises(WhatsAppSendError):
+        a.send_text("15551234567", "hello")
+
+
+def test_deliver_due_followups_records_failure_on_http_error(monkeypatch):
+    agent = _FakeAgent()
+    a = _adapter(agent)
+
+    class _Resp:
+        status_code = 500
+        text = "internal error"
+
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: _Resp())
+    a.deliver_due_followups()
+    assert ("failed", 1) in agent.calls
+    assert ("sent", 1) not in agent.calls
+
+
+def test_handle_payload_cleans_up_attachments_when_reply_fails(monkeypatch, tmp_path):
+    # An expired token makes the reply raise WhatsAppSendError; the handler must
+    # not let it escape (which would skip the rest of the webhook batch) and the
+    # attachment temp file must still be deleted (the leak #179 closed).
+    png = tmp_path / "schematic.png"
+    png.write_bytes(b"\x89PNG\r\n\x1a\n")
+    agent = _FakeAgent(attachments=[str(png)])
+    a = _adapter(agent)
+
+    class _Resp:
+        status_code = 401
+        text = '{"error": {"message": "expired token"}}'
+
+    monkeypatch.setattr("requests.post", lambda *args, **kwargs: _Resp())
+    # Must not raise.
+    a.handle_payload(_incoming_payload("draw my system"))
+    assert not png.exists()
 
 
 # --- inbound images ---------------------------------------------------------------------
@@ -465,3 +740,36 @@ def test_the_cli_exposes_whatsapp_beside_bot():
     for a in actions:
         names.update(a.choices)
     assert "whatsapp" in names and "bot" in names
+
+
+# --- the allowlist, in the form people actually type (found live 2026-09-30) ---------------
+
+def test_an_allowed_number_written_with_plus_and_spaces_still_matches_meta_digits():
+    """Setup accepted "+886 ..." while Meta sends "886...": every message was dropped."""
+    a = _adapter(allowed_ids=["+886 912-345 678"])
+    assert a._allowed("886912345678")
+
+
+def test_a_number_not_on_the_list_is_dropped_out_loud(caplog):
+    a = _adapter(allowed_ids=["886912345678"])
+    with caplog.at_level("WARNING"):
+        assert not a._allowed("22670000099")
+    assert "DROPPED" in caplog.text and "ending 99" in caplog.text
+    assert "22670000099" not in caplog.text
+
+
+def test_describe_payload_names_kinds_never_content():
+    msg = {"entry": [{"changes": [{"value": {"messages": [
+        {"from": "886912345678", "type": "text", "text": {"body": "my tilapia are gasping"}}]}}]}]}
+    out = WhatsAppAdapter.describe_payload(msg)
+    assert "1 message(s): text" in out
+    assert "tilapia" not in out and "886912345678" not in out
+    status = {"entry": [{"changes": [{"value": {"statuses": [{"status": "read"}]}}]}]}
+    assert "status update" in WhatsAppAdapter.describe_payload(status)
+
+
+def test_a_failed_status_names_metas_error():
+    st = {"entry": [{"changes": [{"value": {"statuses": [{"status": "failed", "errors": [
+        {"code": 131047, "title": "Re-engagement message"}]}]}}]}]}
+    out = WhatsAppAdapter.describe_payload(st)
+    assert "failed" in out and "131047" in out
